@@ -26,4 +26,15 @@ public final class ExtensionViews {
 
     public record RefreshErrorView(String error, List<FailureView> failures) {
     }
+
+    /** 单个扩展的差异判定与处理结论视图。 */
+    public record ChangeView(String id, String action, String reason, String detail) {
+    }
+
+    /** 一次刷新/回滚的结果视图：当前快照 + 逐扩展处理结论。 */
+    public record RefreshResultView(String frameworkVersion, List<ExtensionView> extensions,
+                                    boolean applied, boolean rolledBack,
+                                    String previousFingerprint, String currentFingerprint,
+                                    List<ChangeView> changes) {
+    }
 }

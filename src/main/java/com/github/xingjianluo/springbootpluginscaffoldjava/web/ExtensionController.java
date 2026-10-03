@@ -2,9 +2,11 @@ package com.github.xingjianluo.springbootpluginscaffoldjava.web;
 
 import com.github.xingjianluo.springbootpluginscaffoldjava.extension.EnabledExtensions;
 import com.github.xingjianluo.springbootpluginscaffoldjava.extension.Extension;
+import com.github.xingjianluo.springbootpluginscaffoldjava.extension.ExtensionChange;
 import com.github.xingjianluo.springbootpluginscaffoldjava.extension.ExtensionConfiguration;
 import com.github.xingjianluo.springbootpluginscaffoldjava.extension.ExtensionDeclaration;
 import com.github.xingjianluo.springbootpluginscaffoldjava.extension.ExtensionManager;
+import com.github.xingjianluo.springbootpluginscaffoldjava.extension.RefreshReport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -17,7 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 查询当前生效扩展、提交刷新配置。
+ * 查询当前生效扩展、提交增量刷新配置、回到上一次成功配置。
  * 查询直接读取不可变快照，刷新期间只会看到完整的旧集合或完整的新集合。
  */
 @RestController
@@ -38,7 +40,8 @@ public class ExtensionController {
     }
 
     @PostMapping("/refresh")
-    public ExtensionViews.SnapshotView refresh(@RequestBody(required = false) ExtensionViews.RefreshRequest request) {
+    public ExtensionViews.RefreshResultView refresh(
+            @RequestBody(required = false) ExtensionViews.RefreshRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("request body must not be null");
         }
@@ -49,8 +52,15 @@ public class ExtensionController {
         ExtensionConfiguration configuration = ExtensionConfiguration.of(frameworkVersion, declarations);
         log.info("refresh api called: frameworkVersion={}, enabled={}", frameworkVersion,
                 declarations.stream().map(ExtensionDeclaration::className).toList());
-        extensionManager.refresh(configuration);
-        return toView(extensionManager.current());
+        RefreshReport report = extensionManager.refresh(configuration);
+        return toResultView(extensionManager.current(), report);
+    }
+
+    @PostMapping("/rollback")
+    public ExtensionViews.RefreshResultView rollback() {
+        log.info("rollback api called: restoring last successfully applied configuration");
+        RefreshReport report = extensionManager.rollback();
+        return toResultView(extensionManager.current(), report);
     }
 
     private static List<ExtensionDeclaration> parseDeclarations(List<String> enabled) {
@@ -78,6 +88,21 @@ public class ExtensionController {
                 .map(ExtensionController::toExtensionView)
                 .toList();
         return new ExtensionViews.SnapshotView(snapshot.configuration().frameworkVersion(), views);
+    }
+
+    private static ExtensionViews.RefreshResultView toResultView(EnabledExtensions snapshot,
+                                                                 RefreshReport report) {
+        return new ExtensionViews.RefreshResultView(
+                snapshot.configuration().frameworkVersion(),
+                snapshot.extensions().stream().map(ExtensionController::toExtensionView).toList(),
+                report.applied(), report.rolledBack(),
+                report.previousFingerprint(), report.currentFingerprint(),
+                report.changes().stream().map(ExtensionController::toChangeView).toList());
+    }
+
+    private static ExtensionViews.ChangeView toChangeView(ExtensionChange change) {
+        return new ExtensionViews.ChangeView(change.id(), change.action().name(),
+                change.reason().name(), change.detail());
     }
 
     private static ExtensionViews.ExtensionView toExtensionView(Extension extension) {
