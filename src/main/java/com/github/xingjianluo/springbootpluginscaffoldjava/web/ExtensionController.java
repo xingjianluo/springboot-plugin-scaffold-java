@@ -5,6 +5,7 @@ import com.github.xingjianluo.springbootpluginscaffoldjava.extension.Extension;
 import com.github.xingjianluo.springbootpluginscaffoldjava.extension.ExtensionConfiguration;
 import com.github.xingjianluo.springbootpluginscaffoldjava.extension.ExtensionDeclaration;
 import com.github.xingjianluo.springbootpluginscaffoldjava.extension.ExtensionManager;
+import com.github.xingjianluo.springbootpluginscaffoldjava.extension.RefreshReport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -38,7 +39,7 @@ public class ExtensionController {
     }
 
     @PostMapping("/refresh")
-    public ExtensionViews.SnapshotView refresh(@RequestBody(required = false) ExtensionViews.RefreshRequest request) {
+    public ExtensionViews.RefreshResponseView refresh(@RequestBody(required = false) ExtensionViews.RefreshRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("request body must not be null");
         }
@@ -49,8 +50,19 @@ public class ExtensionController {
         ExtensionConfiguration configuration = ExtensionConfiguration.of(frameworkVersion, declarations);
         log.info("refresh api called: frameworkVersion={}, enabled={}", frameworkVersion,
                 declarations.stream().map(ExtensionDeclaration::className).toList());
-        extensionManager.refresh(configuration);
-        return toView(extensionManager.current());
+        RefreshReport report = extensionManager.refresh(configuration);
+        return toResponse(extensionManager.current(), report);
+    }
+
+    /**
+     * 一步回到上一次成功生效的配置：复用当时快照的同一批实例，不照配置重建。
+     * 没有可回退快照时返回 409。
+     */
+    @PostMapping("/restore")
+    public ExtensionViews.RefreshResponseView restore() {
+        log.info("restore api called: currentIds={}", extensionManager.current().ids());
+        RefreshReport report = extensionManager.restore();
+        return toResponse(extensionManager.current(), report);
     }
 
     private static List<ExtensionDeclaration> parseDeclarations(List<String> enabled) {
@@ -78,6 +90,20 @@ public class ExtensionController {
                 .map(ExtensionController::toExtensionView)
                 .toList();
         return new ExtensionViews.SnapshotView(snapshot.configuration().frameworkVersion(), views);
+    }
+
+    private static ExtensionViews.RefreshResponseView toResponse(EnabledExtensions snapshot,
+                                                                 RefreshReport report) {
+        List<ExtensionViews.DecisionView> decisions = report.decisions().stream()
+                .map(d -> new ExtensionViews.DecisionView(d.id(), d.action().name(), d.reason()))
+                .toList();
+        ExtensionViews.RefreshReportView reportView = new ExtensionViews.RefreshReportView(
+                report.mode(), report.fingerprint(), report.skipped(),
+                decisions, report.snapshotIds());
+        return new ExtensionViews.RefreshResponseView(
+                snapshot.configuration().frameworkVersion(),
+                snapshot.extensions().stream().map(ExtensionController::toExtensionView).toList(),
+                reportView);
     }
 
     private static ExtensionViews.ExtensionView toExtensionView(Extension extension) {

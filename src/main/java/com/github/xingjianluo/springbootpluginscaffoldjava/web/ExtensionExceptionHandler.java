@@ -38,6 +38,16 @@ public class ExtensionExceptionHandler {
                 .body(new ExtensionViews.RefreshErrorView("INVALID_REQUEST", List.of(failure)));
     }
 
+    /** 没有上一次成功快照可回退等非法状态：409，当前生效集合不受影响。 */
+    @ExceptionHandler(IllegalStateException.class)
+    public ResponseEntity<ExtensionViews.RefreshErrorView> handleConflict(IllegalStateException ex) {
+        ExtensionViews.FailureView failure =
+                new ExtensionViews.FailureView("INVALID_STATE", null, null, ex.getMessage());
+        log.warn("extension operation rejected by state: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ExtensionViews.RefreshErrorView("INVALID_STATE", List.of(failure)));
+    }
+
     private static ExtensionViews.FailureView toView(ExtensionFailure failure) {
         return new ExtensionViews.FailureView(
                 failure.reason().name(), failure.source(), failure.conflict(), failure.detail());
