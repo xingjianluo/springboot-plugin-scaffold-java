@@ -35,7 +35,11 @@ public interface Extension {
     default void activate() {
     }
 
-    /** 扩展退出生效集合时回调。 */
+    /**
+     * 扩展退出生效集合时回调。
+     * 注意：为释放构造阶段已占用的资源，本方法也可能在实例<b>从未成功激活</b>时
+     * 被调用（例如本次提交被整体拒绝、实例建出来却未启用），实现需保证幂等容错。
+     */
     default void deactivate() {
     }
 }

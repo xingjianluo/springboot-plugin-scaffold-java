@@ -16,7 +16,8 @@ extension/
   ExtensionDeclaration      一条声明：实现类全名 + 可选优先级覆盖
   ExtensionConfiguration    一次刷新的输入：框架版本 + 有序声明列表（含幂等指纹）
   EnabledExtensions         已生效扩展的不可变快照
-  ExtensionPlanBuilder      离线校验 + 确定性拓扑排序，产出可生效快照
+  ExtensionPlanBuilder      离线校验 + 确定性拓扑排序，产出可生效快照（支持复用池，未变化类不再实例化）
+  BuiltSnapshot             离线构建结果：可生效快照 + 本次真正新建的实例清单
   ExtensionManager          运行时管理器：查询 / 增量刷新 / 回到上一次成功配置
   DefaultExtensionManager   增量原子切换、实例复用、串行刷新、指纹幂等、失败回退
   ExtensionRefreshPlanner   差异计算：新增/移除/重建/沿用判定与依赖连带重建
@@ -53,7 +54,8 @@ public class MyFeatureExtension implements Extension {
     public Set<String> requiredExtensions()  { return Set.of("my-core"); } // 依赖的扩展 id
     public String requiredFrameworkVersion() { return "1.0.0"; }        // 最低宿主版本
     public void activate()   { /* 进入生效集合时调用 */ }
-    public void deactivate() { /* 退出生效集合时调用 */ }
+    public void deactivate() { /* 退出生效集合时调用；提交被拒绝时也可能用于回收
+                                  建出来却未启用的实例，需幂等容错 */ }
 }
 ```
 
@@ -154,9 +156,11 @@ Content-Type: application/json
 - **原子可见性**：生效集合保存在不可变快照中，经 `AtomicReference` 切换。
   刷新期间 `GET /api/extensions` 只会观察到完整的旧集合或完整的新集合，
   不会出现半加载或新旧混用。
-- **构建与生效分离**：新扩展先离线完成全部校验与实例化，再依次 `activate()`；
-  任何一步失败，已激活的新实例按相反顺序 `deactivate()`，本次切换被整体拒绝，
-  **旧集合与对外状态完全不变，旧实例继续可用**。
+- **构建与生效分离**：新扩展先离线完成全部校验与（仅限真正需要新建的）实例化，
+  再依次 `activate()`；任何一步失败，已激活的新实例按相反顺序 `deactivate()`，
+  本次新建却还没来得及激活的实例也会被 `deactivate()` 回收，本次切换被整体拒绝，
+  **旧集合与对外状态完全不变，旧实例继续可用**——被拒绝的提交不会留下
+  “建出来又没启用就丢掉”的孤儿实例占用资源。
 - **幂等**：对 `(框架版本, 声明序列)` 计算稳定指纹，重复提交相同配置直接跳过
   （`applied=false`），不产生任何重建，快照引用保持不变。
 - **串行化**：刷新在同一锁内执行，并发提交只会产生合法的完整快照之一。
@@ -179,15 +183,21 @@ Content-Type: application/json
 
 要点：
 
-- **沿用是严格的“同一份实例”**：被判定为 `REUSED` 的扩展直接保留当前运行对象，
-  既不会被悄悄换成新实例，也不会先停再启；因此连接池、缓存、后台线程这类重资源
-  在“与它无关的变更”中完全不受影响。
+- **沿用是严格的“同一份实例”**：被判定为 `REUSED` 的扩展直接保留当前运行对象。
+  “沿用”意味着以下行为**都不会发生**：
+  - 不会调用构造器——未变化扩展的创建/初始化在其整个生命周期内**只发生一次**
+    （连接池、缓存、后台线程这类构造期重资源不会被白起一份）；
+  - 不会调用 `activate()` / `deactivate()`，不会先停再启；
+  - 不会被悄悄替换成新实例，刷新前后 `current().byId(id)` 返回同一对象。
+- **创建只发生在被判为 `ADDED` / `REBUILT` 的扩展上**：离线构建携带“复用池”，
+  命中当前运行实例的声明不再实例化；依赖连带重建通过不动点循环只强制重建
+  真正受影响的 id，不会扩大为全量重建。
 - **连带重建沿依赖边向上传播到不动点**：只要某个扩展依赖（直接或传递）的对象
   被新增或替换，该扩展也会被重建。例如用另一个同 id 实现替换 `demo-core`，
   依赖它的 `demo-feature` 会被一并重建，保证不会出现“新 core + 旧 feature”的混合态。
-- **开销与变化规模成正比**：增量刷新只对 `ADDED/REBUILT` 的实例执行 `activate()`，
-  只对 `REMOVED/REBUILT` 的旧实例执行 `deactivate()`；新增一个与现有扩展无关的
-  扩展时，其余扩展零生命周期回调。
+- **开销与变化规模成正比**：增量刷新只对 `ADDED/REBUILT` 的实例执行构造与
+  `activate()`，只对 `REMOVED/REBUILT` 的旧实例执行 `deactivate()`；
+  新增一个与现有扩展无关的扩展时，其余扩展的创建次数与生命周期回调都是零。
 - 依赖被**移除**（新配置不再声明被依赖方）属于非法配置，会在离线校验阶段以
   `MISSING_DEPENDENCY` 拒绝，本次刷新不生效，因此不存在“依赖突然消失”的运行态。
 
@@ -278,6 +288,11 @@ mvn test
   - 多写者 + 多读者并发期间只观察到完整快照；
   - 回退恢复上一次成功快照及其原实例、无可回退目标时抛错；
   - 单次新增只产生一次激活，开销随实际差异变化；
+- `IncrementalReuseGuaranteeTest`（“只创建一次”回归守卫，直接统计构造器调用次数）：
+  - 只新增无关扩展 / 只移除一个扩展：未变化扩展构造器零增量、零生命周期回调；
+  - 替换实现连带依赖方：被替换者与依赖方各恰好重建一次，无关扩展完全不动；
+  - 校验拒绝 / 激活拒绝：未变化扩展零重建，建出来却没启用的实例被回收、无孤儿；
+  - 相同配置重复提交零创建；并发提交下未变化扩展全程只创建一次、最终为合法完整快照；
 - `IncrementalRollbackControllerTest`：刷新报告各扩展动作/原因、幂等 `applied=false`、
   回退接口恢复旧快照、无可回退目标返回 409；
 - `ExtensionControllerTest`：查询、刷新成功、422 原因可区分、非法请求 400；
@@ -289,7 +304,21 @@ mvn test
 mvn test -Dtest=IncrementalRefreshTest
 ```
 
-### 7.2 启动后手工验证
+### 7.2 复现并验证“沿用 = 只创建一次”
+
+`IncrementalReuseGuaranteeTest` 用一组构造即计数的“重资源”扩展
+（`HeavyResourceExtension` 等，构造器模拟连接池/缓存初始化并由
+`ResourceLifecycleTracker` 统计每类的 构造/激活/停用 次数）直接验证本节的保证：
+
+```bash
+mvn test -Dtest=IncrementalReuseGuaranteeTest
+```
+
+日志中可看到每次提交的输入指纹、逐扩展差异判定（`diff: ...`）与处理结果，
+断言则检查未变化扩展的 `created` 计数严格为 1、激活/停用零增量，
+以及被拒绝提交不留下 `live = created - deactivated > 0` 的孤儿实例。
+
+### 7.3 启动后手工验证
 
 ```bash
 mvn spring-boot:run

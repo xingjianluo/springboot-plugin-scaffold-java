@@ -4,7 +4,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -12,10 +16,12 @@ import java.util.concurrent.atomic.AtomicReference;
  * <ul>
  *   <li>查询永远读到完整旧快照或完整新快照，切换期间不会观察到半更新或新旧混用状态；</li>
  *   <li>刷新经同一把锁串行化，并按配置指纹幂等跳过相同提交（不产生任何重建）；</li>
- *   <li>只有真正变化（实现变更或其依赖链变化）的扩展才重建，其余沿用同一运行实例，
- *       既不停用也不重新激活；生命周期回调与差异规模成正比；</li>
- *   <li>新实例先离线校验、再依次激活；任一步失败则反向停用本次新激活者并整体回退，
- *       旧集合实例始终保持可用；</li>
+ *   <li>只有真正变化（实现变更或其依赖链变化）的扩展才重建，其余沿用同一运行实例：
+ *       既不停用也不重新激活，<b>构造器也不会被再次调用</b>——未变化扩展的创建/初始化
+ *       在其整个生命周期内只发生一次；生命周期回调与差异规模成正比；</li>
+ *   <li>新实例先离线校验、再依次激活；任一步失败则反向停用本次新激活者、回收本次新建
+ *       却从未启用的实例并整体回退，旧集合实例始终保持可用，被拒绝的提交不留下
+ *       任何占用资源的孤儿例；</li>
  *   <li>记录上一次成功生效快照，{@link #rollback()} 一步恢复并复用当时的实例。</li>
  * </ul>
  */
@@ -63,17 +69,63 @@ public class DefaultExtensionManager implements ExtensionManager {
                         unchangedChanges(currentSnapshot));
             }
 
-            // 离线构建：任何校验/实例化失败都在此抛出，旧状态原样保留
-            EnabledExtensions built = planBuilder.build(configuration);
+            // 离线构建 + 差异判定的不动点循环：
+            // 复用池保证未变化扩展自始至终只有运行中的那一份实例（构造器零调用）；
+            // 被判 REBUILT 但池中只有旧实例的（依赖连带），移出复用池后重新构建，
+            // 直到计划要求的每个重建都持有对应的新实例。循环每轮至少新增一个强制重建 id，
+            // 因而必然终止。
+            Map<String, Extension> reusePool = new HashMap<>();
+            for (Extension running : currentSnapshot.extensions()) {
+                reusePool.put(running.getClass().getName(), running);
+            }
+            List<Extension> createdTotal = new ArrayList<>();
+            IncrementalPlan plan;
+            while (true) {
+                BuiltSnapshot built;
+                try {
+                    built = planBuilder.build(configuration, reusePool);
+                } catch (ExtensionLoadException ex) {
+                    // 本次 build 新建的实例已由 builder 回收；这里回收此前各轮新建
+                    // 却从未启用的实例，被拒绝的提交不留下任何占用资源的孤儿实例
+                    deactivateQuietly(createdTotal, "rejected submission cleanup");
+                    log.error("refresh rejected during offline build, previous snapshot intact: "
+                            + "previousIds={}, failures={}", currentSnapshot.ids(),
+                            ex.failures().stream().map(ExtensionFailure::describe).toList());
+                    throw ex;
+                }
+                createdTotal.addAll(built.createdInstances());
+                // 本轮新建实例并入复用池：若还需下一轮构建，新增/替换的扩展不会重复构造
+                for (Extension created : built.createdInstances()) {
+                    reusePool.put(created.getClass().getName(), created);
+                }
 
-            // 差异判定：决定新增/移除/重建/沿用与依赖连带
-            IncrementalPlan plan = refreshPlanner.plan(currentSnapshot, built);
+                plan = refreshPlanner.plan(currentSnapshot, built.snapshot());
+                Set<String> needsFreshInstance = new HashSet<>();
+                for (ExtensionChange change : plan.changes()) {
+                    if (change.action() == ExtensionAction.REBUILT
+                            && built.snapshot().byId(change.id()) == currentSnapshot.byId(change.id())) {
+                        // 计划要求重建，但手里还是沿用池中的旧实例：强制真正重建
+                        needsFreshInstance.add(change.id());
+                    }
+                }
+                if (needsFreshInstance.isEmpty()) {
+                    break;
+                }
+                log.info("dependency-triggered rebuild requires fresh instances: ids={}",
+                        needsFreshInstance);
+                for (String id : needsFreshInstance) {
+                    Extension running = currentSnapshot.byId(id);
+                    if (running != null) {
+                        reusePool.remove(running.getClass().getName());
+                    }
+                }
+            }
             log.info("incremental diff computed: added={}, rebuilt={}, removed={}, reused={}",
                     count(plan, ExtensionAction.ADDED), count(plan, ExtensionAction.REBUILT),
                     count(plan, ExtensionAction.REMOVED), count(plan, ExtensionAction.REUSED));
             plan.changes().forEach(change -> log.info("diff: {}", change.describe()));
 
-            applyPlan(plan, currentSnapshot);
+            applyPlan(plan, currentSnapshot, createdTotal);
 
             active.set(plan.targetSnapshot());
             previous = currentSnapshot;
@@ -81,6 +133,10 @@ public class DefaultExtensionManager implements ExtensionManager {
                     plan.targetSnapshot().ids(), currentSnapshot.ids());
 
             deactivateRetired(plan.toDeactivate());
+            // 安全网：新建却最终未进入目标快照的实例（正常流程不应出现）必须回收
+            List<Extension> orphaned = new ArrayList<>(createdTotal);
+            orphaned.removeAll(plan.targetSnapshot().extensions());
+            deactivateQuietly(orphaned, "created but not part of the applied snapshot");
             return new RefreshReport(true, false,
                     currentSnapshot.configuration().fingerprint(), fingerprint, plan.changes());
         }
@@ -106,7 +162,7 @@ public class DefaultExtensionManager implements ExtensionManager {
                     count(plan, ExtensionAction.REMOVED));
             plan.changes().forEach(change -> log.info("rollback diff: {}", change.describe()));
 
-            applyPlan(plan, currentSnapshot);
+            applyPlan(plan, currentSnapshot, List.of());
 
             active.set(plan.targetSnapshot());
             previous = currentSnapshot;
@@ -125,8 +181,14 @@ public class DefaultExtensionManager implements ExtensionManager {
         return active.get();
     }
 
-    /** 依次激活计划中的新实例；失败则反向停用本次已激活者并整体拒绝，旧状态不动。 */
-    private void applyPlan(IncrementalPlan plan, EnabledExtensions currentSnapshot) {
+    /**
+     * 依次激活计划中的新实例；失败则反向停用本次已激活者、回收本次新建却从未激活的
+     * 实例，并整体拒绝，旧状态不动。
+     *
+     * @param createdThisRefresh 本次刷新新建的全部实例（用于失败时回收未激活者）
+     */
+    private void applyPlan(IncrementalPlan plan, EnabledExtensions currentSnapshot,
+                           List<Extension> createdThisRefresh) {
         for (int i = 0; i < plan.toActivate().size(); i++) {
             Extension extension = plan.toActivate().get(i);
             try {
@@ -142,12 +204,31 @@ public class DefaultExtensionManager implements ExtensionManager {
                                 deactivateEx);
                     }
                 }
+                // 本次新建但还没来得及激活的实例也要回收，不能留下占用资源的孤儿
+                List<Extension> neverActivated = new ArrayList<>(createdThisRefresh);
+                for (int j = 0; j < i; j++) {
+                    neverActivated.remove(plan.toActivate().get(j));
+                }
+                deactivateQuietly(neverActivated, "never activated before rejection");
                 ExtensionFailure failure = new ExtensionFailure(
                         ExtensionFailureReason.ACTIVATION_FAILED,
                         extension.id(), null, "activate() threw: " + ex);
                 log.error("refresh rejected, rollback completed, previous snapshot still usable: "
                         + "previousIds={}, {}", currentSnapshot.ids(), failure.describe(), ex);
                 throw new ExtensionLoadException(List.of(failure));
+            }
+        }
+    }
+
+    /** 尽力停用一批实例（用于被拒绝提交的清理），异常只记日志不影响旧状态。 */
+    private void deactivateQuietly(List<Extension> instances, String why) {
+        for (Extension instance : instances) {
+            try {
+                instance.deactivate();
+                log.info("discarded instance deactivated ({}): id={}", why, instance.id());
+            } catch (RuntimeException ex) {
+                log.warn("deactivate() of a discarded instance failed ({}): id={}",
+                        why, instance.id(), ex);
             }
         }
     }
