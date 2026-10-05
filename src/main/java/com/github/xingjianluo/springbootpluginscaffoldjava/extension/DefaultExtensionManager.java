@@ -12,10 +12,12 @@ import java.util.concurrent.atomic.AtomicReference;
  * <ul>
  *   <li>查询永远读到完整旧快照或完整新快照，切换期间不会观察到半更新或新旧混用状态；</li>
  *   <li>刷新经同一把锁串行化，并按配置指纹幂等跳过相同提交（不产生任何重建）；</li>
- *   <li>只有真正变化（实现变更或其依赖链变化）的扩展才重建，其余沿用同一运行实例，
- *       既不停用也不重新激活；生命周期回调与差异规模成正比；</li>
- *   <li>新实例先离线校验、再依次激活；任一步失败则反向停用本次新激活者并整体回退，
- *       旧集合实例始终保持可用；</li>
+ *   <li>只有真正变化（实现变更或其依赖链变化）的扩展才重建，其余沿用同一运行实例：
+ *       不重新构造、不停用、不重新激活，创建/初始化从头到尾只发生一次；
+ *       生命周期回调与差异规模成正比；</li>
+ *   <li>新实例先离线校验、再依次激活；任一步失败则反向停用本次新激活者、
+ *       回收本次新建但从未启用的实例（deactivate 释放其资源），并整体回退，
+ *       旧集合实例始终保持可用，未变化扩展也不会因此多创建一份；</li>
  *   <li>记录上一次成功生效快照，{@link #rollback()} 一步恢复并复用当时的实例。</li>
  * </ul>
  */
@@ -63,8 +65,10 @@ public class DefaultExtensionManager implements ExtensionManager {
                         unchangedChanges(currentSnapshot));
             }
 
-            // 离线构建：任何校验/实例化失败都在此抛出，旧状态原样保留
-            EnabledExtensions built = planBuilder.build(configuration);
+            // 离线增量构建：与运行实例同类的声明直接沿用该实例，只有新增/实现变更/
+            // 依赖连带的扩展才会新建；任何校验失败都在此抛出，旧状态原样保留，
+            // 本次新建但从未启用的实例由构建器负责回收
+            EnabledExtensions built = planBuilder.build(configuration, currentSnapshot);
 
             // 差异判定：决定新增/移除/重建/沿用与依赖连带
             IncrementalPlan plan = refreshPlanner.plan(currentSnapshot, built);
@@ -139,6 +143,19 @@ public class DefaultExtensionManager implements ExtensionManager {
                         activated.deactivate();
                     } catch (RuntimeException deactivateEx) {
                         log.warn("rollback deactivate() failed: id={}", activated.id(),
+                                deactivateEx);
+                    }
+                }
+                // 激活失败者和还没轮到激活的新实例同样要回收，
+                // 不能留下“建出来却没启用”的孤儿实例占着资源
+                for (int j = plan.toActivate().size() - 1; j >= i; j--) {
+                    Extension neverActivated = plan.toActivate().get(j);
+                    try {
+                        neverActivated.deactivate();
+                        log.info("recycled never-activated instance after rejection: id={}",
+                                neverActivated.id());
+                    } catch (RuntimeException deactivateEx) {
+                        log.warn("recycle deactivate() failed: id={}", neverActivated.id(),
                                 deactivateEx);
                     }
                 }

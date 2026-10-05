@@ -16,9 +16,10 @@ import java.util.Set;
  *
  * <p>沿用判定（同一 id）：
  * <ul>
+ *   <li>目标快照中的就是当前正在运行的同一份实例 → 沿用，从头到尾不触碰；</li>
  *   <li>实现类变化 → 重建；</li>
+ *   <li>同类但换了一份新实例（增量构建判定其依赖链有变化）→ 重建；</li>
  *   <li>仅优先级覆盖变化 → 沿用实例，仅生效顺序改变；</li>
- *   <li>其余 → 沿用；</li>
  *   <li>但只要其依赖链上有任何扩展被新增/重建，就连带升级为重建，
  *       避免依赖方与被依赖方的新旧版本在同一时刻混用。</li>
  * </ul>
@@ -27,7 +28,8 @@ public class ExtensionRefreshPlanner {
 
     /**
      * @param current 当前生效快照（可能为空快照）
-     * @param target  离线构建并校验通过的新快照（全部为全新实例）
+     * @param target  离线构建并校验通过的新快照（沿用项为运行中的同一份实例，
+     *                新增/重建项为本次新建实例）
      * @return 增量生效计划
      */
     public IncrementalPlan plan(EnabledExtensions current, EnabledExtensions target) {
@@ -49,12 +51,22 @@ public class ExtensionRefreshPlanner {
             }
             String oldClass = old.getClass().getName();
             String newClass = fresh.getClass().getName();
-            if (!oldClass.equals(newClass)) {
+            if (old != fresh && !oldClass.equals(newClass)) {
                 decisions.put(id, new Decision(ExtensionAction.REBUILT,
                         ExtensionChangeReason.IMPLEMENTATION_CHANGED,
                         "implementation changed from " + oldClass + " to " + newClass));
                 continue;
             }
+            if (old != fresh) {
+                // 同类但已换成新实例：增量构建判定其依赖链有变化，必须连带重建
+                decisions.put(id, new Decision(ExtensionAction.REBUILT,
+                        ExtensionChangeReason.DEPENDENCY_REBUILT,
+                        "a dependency of this extension is added or rebuilt; "
+                                + "dependent must be rebuilt together "
+                                + "to avoid mixing old and new instances"));
+                continue;
+            }
+            // old == fresh：正在运行的同一份实例，直接沿用
             Integer oldPrio = priorityOf(old, currentDecl);
             Integer newPrio = priorityOf(fresh, targetDecl);
             if (!java.util.Objects.equals(oldPrio, newPrio)) {
